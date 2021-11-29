@@ -2301,7 +2301,7 @@ object PushAggregationBeforeJoin extends Rule[LogicalPlan] {
             ), finalAggExp.name)()
           case _: Min =>
             Alias(AggregateExpression(
-              aggregateFunction = Max(finalAggExp.toAttribute),
+              aggregateFunction = Min(finalAggExp.toAttribute),
               mode = aggFunc.mode,
               isDistinct = aggFunc.isDistinct
             ), finalAggExp.name)()
@@ -2401,7 +2401,7 @@ object PushAggregationBeforeJoin extends Rule[LogicalPlan] {
     def getLeftMinAggregate = {
       val leftMinAggName = "min" + "_" + leftTableCol.name
       val leftMinAggregate = findExpression(leftTransformedAggregateExps, leftMinAggName).getOrElse(Alias(AggregateExpression(
-        aggregateFunction = Max(leftTableCol),
+        aggregateFunction = Min(leftTableCol),
         mode = aggregateExpression.mode,
         isDistinct = aggregateExpression.isDistinct
       ), leftMinAggName)())
