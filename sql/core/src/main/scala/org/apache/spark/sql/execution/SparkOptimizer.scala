@@ -85,5 +85,6 @@ class SparkOptimizer(
    *
    * Note that 'Extract Python UDFs' batch is an exception and ran after the batches defined here.
    */
-   def postHocOptimizationBatches: Seq[Batch] = Nil
+   def postHocOptimizationBatches: Seq[Batch] =
+     Seq(Batch("Aggregation Before Join", FixedPoint(1), PushAggregationBeforeJoin))
 }

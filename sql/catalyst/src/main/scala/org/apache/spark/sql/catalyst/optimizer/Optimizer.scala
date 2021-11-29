@@ -2213,3 +2213,594 @@ object OptimizeLimitZero extends Rule[LogicalPlan] {
       empty(ll)
   }
 }
+
+object PushAggregationBeforeJoin extends Rule[LogicalPlan] {
+  def apply(plan: LogicalPlan): LogicalPlan = plan transform {
+    case a@Aggregate(groupingExpressions, aggregateExpressions, Project(projectList, Join(left, right, joinType, condition, hint)))
+      if joinType == Inner =>
+      print(plan.toString)
+      // combine the groupByAttributes with the attributes in join condition to get overall groupByAttributes
+      var groupByAttributes = groupingExpressions.asInstanceOf[Seq[AttributeReference]]
+      for (attribute <- condition.asInstanceOf[Some[EqualTo]].value.references.toSeq) {
+        if (!groupByAttributes.contains(attribute))
+          groupByAttributes = groupByAttributes :+ attribute.asInstanceOf[AttributeReference]
+      }
+
+      // separate the left and right groupByAttributes for constructing left and right aggregateExps
+      var leftGroupByAttributes: Seq[AttributeReference] = Seq()
+      var rightGroupByAttributes: Seq[AttributeReference] = Seq()
+      for (attribute <- groupByAttributes) {
+        if (left.references.contains(attribute))
+          leftGroupByAttributes = leftGroupByAttributes :+ attribute
+        else
+          rightGroupByAttributes = rightGroupByAttributes :+ attribute
+      }
+
+      // identify the aggregation columns and non-aggregate columns present in the final query
+      var nonAggregateAttributes: Seq[AttributeReference] = Seq()
+      var leftTransformedAggregateExps: Seq[Alias] = Seq()
+      var rightTransformedAggregateExps: Seq[Alias] = Seq()
+      var finalAggregateExps: Seq[Alias] = Seq()
+      var aggregateFunctions: Seq[AggregateExpression] = Seq()
+      for (exp <- aggregateExpressions) {
+        exp match {
+          case reference: AttributeReference =>
+            nonAggregateAttributes = nonAggregateAttributes :+ reference
+          case _: Alias if exp.children.head.isInstanceOf[AggregateExpression] =>
+            // TODO: Get rid of the assumption that an aggregation expression is wrapped with an Alias
+            val aggExp = exp.children.head.asInstanceOf[AggregateExpression]
+            val aggExpAliasName = exp.name
+            for (projectExp <- projectList) {
+              if (aggExp.aggregateFunction.children.head.asInstanceOf[AttributeReference].exprId.equals(projectExp.exprId)) {
+                var returnTuple: Tuple3[Seq[Alias], Seq[Alias], Seq[Alias]] = Tuple3(Seq(), Seq(), Seq())
+                projectExp match {
+                  case alias: Alias if alias.child.isInstanceOf[BinaryArithmetic] =>
+                    // aggregation over derived columns spanning mnore than one table
+                    // TODO: Get rid of the assumption that the derived column spans more than one table
+                    returnTuple = transformDerivedAggregation(projectExp.asInstanceOf[Alias], aggExp, aggExpAliasName, leftTransformedAggregateExps, rightTransformedAggregateExps)
+                  case _ =>
+                    // aggregation over existing columns
+                    returnTuple = transformSimpleAggregation(left, aggExp, aggExpAliasName, leftTransformedAggregateExps, rightTransformedAggregateExps)
+                }
+                leftTransformedAggregateExps = addIfNotExists(leftTransformedAggregateExps, returnTuple._1)
+                rightTransformedAggregateExps = addIfNotExists(rightTransformedAggregateExps, returnTuple._2)
+                finalAggregateExps = finalAggregateExps ++ returnTuple._3
+                aggregateFunctions = aggregateFunctions :+ aggExp
+              }
+            }
+        }
+      }
+
+      // construct the final transformed expression
+      val leftAggregate = Aggregate(leftGroupByAttributes, leftGroupByAttributes ++ leftTransformedAggregateExps, left)
+      val rightAggregate = Aggregate(rightGroupByAttributes, rightGroupByAttributes ++ rightTransformedAggregateExps, right)
+      val newJoin = Join(leftAggregate, rightAggregate, joinType, condition, hint)
+
+      // do an additional groupby and aggregate to handle the scenario of original groupby cols being a subset of the transformed groupby/aggregates in each table
+      // TODO: Add a check which skips this additional aggregation whenever not required.
+      var newAggregationExps: Seq[Alias] = Seq()
+      for ((aggFunc, finalAggExp) <- aggregateFunctions.zip(finalAggregateExps)) {
+        var aggregate = aggFunc.aggregateFunction match {
+          case _: Sum =>
+            Alias(AggregateExpression(
+              aggregateFunction = Sum(finalAggExp.toAttribute),
+              mode = aggFunc.mode,
+              isDistinct = aggFunc.isDistinct
+            ), finalAggExp.name)()
+          case _: Count =>
+            Alias(AggregateExpression(
+              aggregateFunction = Count(finalAggExp.toAttribute),
+              mode = aggFunc.mode,
+              isDistinct = aggFunc.isDistinct
+            ), finalAggExp.name)()
+          case _: Max =>
+            Alias(AggregateExpression(
+              aggregateFunction = Max(finalAggExp.toAttribute),
+              mode = aggFunc.mode,
+              isDistinct = aggFunc.isDistinct
+            ), finalAggExp.name)()
+          case _: Min =>
+            Alias(AggregateExpression(
+              aggregateFunction = Max(finalAggExp.toAttribute),
+              mode = aggFunc.mode,
+              isDistinct = aggFunc.isDistinct
+            ), finalAggExp.name)()
+        }
+        newAggregationExps = newAggregationExps :+ aggregate
+      }
+      Aggregate(groupingExpressions, nonAggregateAttributes ++ newAggregationExps, Project(nonAggregateAttributes ++ finalAggregateExps, newJoin))
+  }
+
+  private def addIfNotExists(oldExpressions: Seq[Alias], newExpressions: Seq[Alias]): Seq[Alias] = {
+    var modifiedExpressions = oldExpressions
+    for (newExp <- newExpressions) {
+      if (findExpression(oldExpressions, newExp.name).equals(None))
+        modifiedExpressions = modifiedExpressions :+ newExp
+    }
+    modifiedExpressions
+  }
+
+  private def findExpression(expressions: Seq[Alias], expressionName: String): Option[Alias] = {
+    var existingExp: Option[Alias] = None
+    for (exp <- expressions)
+      if (exp.name.equals(expressionName))
+        existingExp = Some(exp)
+    existingExp
+  }
+
+
+  private def transformDerivedAggregation(
+                                           projectAttribute: Alias, aggregateExpression: AggregateExpression,
+                                           aggExpAliasName: String, leftTransformedAggregateExps: Seq[Alias],
+                                           rightTransformedAggregateExps: Seq[Alias]): (Seq[Alias], Seq[Alias], Seq[Alias]) = {
+    val transformFunc = projectAttribute.child
+    // TODO: Get rid of the assumption that the left operand belongs to left table and right operand belongs to right.
+    val leftTableCol = transformFunc.asInstanceOf[BinaryArithmetic].left.asInstanceOf[AttributeReference]
+    val rightTableCol = transformFunc.asInstanceOf[BinaryArithmetic].right.asInstanceOf[AttributeReference]
+
+    def getLeftSumAggregate = {
+      val leftSumAggName = "sum" + "_" + leftTableCol.name
+      val leftSumAggregate = findExpression(leftTransformedAggregateExps, leftSumAggName).getOrElse(Alias(AggregateExpression(
+        aggregateFunction = Sum(leftTableCol),
+        mode = aggregateExpression.mode,
+        isDistinct = aggregateExpression.isDistinct
+      ), leftSumAggName)())
+      leftSumAggregate
+    }
+
+    def getLeftCountAggregate = {
+      val leftCountAggName = "count_left"
+      val leftCountAggregate = findExpression(leftTransformedAggregateExps, leftCountAggName).getOrElse(Alias(AggregateExpression(
+        aggregateFunction = Count(Literal(1)),
+        mode = aggregateExpression.mode,
+        isDistinct = aggregateExpression.isDistinct
+      ), leftCountAggName)())
+      leftCountAggregate
+    }
+
+    def getRightSumAggregate = {
+      val rightSumAggName = "sum" + "_" + rightTableCol.name
+      val rightSumAggregate = findExpression(rightTransformedAggregateExps, rightSumAggName).getOrElse(Alias(AggregateExpression(
+        aggregateFunction = Sum(rightTableCol),
+        mode = aggregateExpression.mode,
+        isDistinct = aggregateExpression.isDistinct
+      ), rightSumAggName)())
+      rightSumAggregate
+    }
+
+    def getRightCountAggregate = {
+      val rightCountAggName = "count_right"
+      val rightCountAggregate = findExpression(rightTransformedAggregateExps, rightCountAggName).getOrElse(Alias(AggregateExpression(
+        aggregateFunction = Count(Literal(1)),
+        mode = aggregateExpression.mode,
+        isDistinct = aggregateExpression.isDistinct
+      ), rightCountAggName)())
+      rightCountAggregate
+    }
+
+    def getRightInverseSumAggName = {
+      val rightInverseSumAggName = "sum_inverse" + "_" + rightTableCol.name
+      val rightInverseSumAggregate = findExpression(rightTransformedAggregateExps, rightInverseSumAggName).getOrElse(Alias(AggregateExpression(
+        aggregateFunction = Sum(Divide(Cast(Literal(1), rightTableCol.dataType), rightTableCol)),
+        mode = aggregateExpression.mode,
+        isDistinct = aggregateExpression.isDistinct
+      ), rightInverseSumAggName)())
+      rightInverseSumAggregate
+    }
+
+    def getLeftMaxAggregate = {
+      val leftMaxAggName = "max" + "_" + leftTableCol.name
+      val leftMaxAggregate = findExpression(leftTransformedAggregateExps, leftMaxAggName).getOrElse(Alias(AggregateExpression(
+        aggregateFunction = Max(leftTableCol),
+        mode = aggregateExpression.mode,
+        isDistinct = aggregateExpression.isDistinct
+      ), leftMaxAggName)())
+      leftMaxAggregate
+    }
+
+    def getLeftMinAggregate = {
+      val leftMinAggName = "min" + "_" + leftTableCol.name
+      val leftMinAggregate = findExpression(leftTransformedAggregateExps, leftMinAggName).getOrElse(Alias(AggregateExpression(
+        aggregateFunction = Max(leftTableCol),
+        mode = aggregateExpression.mode,
+        isDistinct = aggregateExpression.isDistinct
+      ), leftMinAggName)())
+      leftMinAggregate
+    }
+
+    def getRightMaxAggregate = {
+      val rightMaxAggName = "max" + "_" + rightTableCol.name
+      val rightMaxAggregate = findExpression(rightTransformedAggregateExps, rightMaxAggName).getOrElse(Alias(AggregateExpression(
+        aggregateFunction = Max(rightTableCol),
+        mode = aggregateExpression.mode,
+        isDistinct = aggregateExpression.isDistinct
+      ), rightMaxAggName)())
+      rightMaxAggregate
+    }
+
+    def getRightMaxMinusAggregate = {
+      val rightMaxAggName = "max_minus" + "_" + rightTableCol.name
+      val rightMaxAggregate = findExpression(rightTransformedAggregateExps, rightMaxAggName).getOrElse(Alias(AggregateExpression(
+        aggregateFunction = Max(UnaryMinus(rightTableCol)),
+        mode = aggregateExpression.mode,
+        isDistinct = aggregateExpression.isDistinct
+      ), rightMaxAggName)())
+      rightMaxAggregate
+    }
+
+    def getRightMinAggregate = {
+      val rightMinAggName = "min" + "_" + rightTableCol.name
+      val rightMinAggregate = findExpression(rightTransformedAggregateExps, rightMinAggName).getOrElse(Alias(AggregateExpression(
+        aggregateFunction = Min(rightTableCol),
+        mode = aggregateExpression.mode,
+        isDistinct = aggregateExpression.isDistinct
+      ), rightMinAggName)())
+      rightMinAggregate
+    }
+
+    def getRightMinMinusAggregate = {
+      val rightMinAggName = "min_minus" + "_" + rightTableCol.name
+      val rightMinAggregate = findExpression(rightTransformedAggregateExps, rightMinAggName).getOrElse(Alias(AggregateExpression(
+        aggregateFunction = Min(UnaryMinus(rightTableCol)),
+        mode = aggregateExpression.mode,
+        isDistinct = aggregateExpression.isDistinct
+      ), rightMinAggName)())
+      rightMinAggregate
+    }
+
+    def getRightMaxInverseAggregate = {
+      val rightMaxAggName = "max_inverse" + "_" + rightTableCol.name
+      val rightMaxAggregate = findExpression(rightTransformedAggregateExps, rightMaxAggName).getOrElse(Alias(AggregateExpression(
+        aggregateFunction = Max(Divide(Cast(Literal(1), rightTableCol.dataType), rightTableCol)),
+        mode = aggregateExpression.mode,
+        isDistinct = aggregateExpression.isDistinct
+      ), rightMaxAggName)())
+      rightMaxAggregate
+    }
+
+    def getRightMinInverseAggregate = {
+      val rightMinAggName = "min_inverse" + "_" + rightTableCol.name
+      val rightMinAggregate = findExpression(rightTransformedAggregateExps, rightMinAggName).getOrElse(Alias(AggregateExpression(
+        aggregateFunction = Min(Divide(Cast(Literal(1), rightTableCol.dataType), rightTableCol)),
+        mode = aggregateExpression.mode,
+        isDistinct = aggregateExpression.isDistinct
+      ), rightMinAggName)())
+      rightMinAggregate
+    }
+
+    def transformSumAddSubtract = {
+      val leftSumAggregate: Alias = getLeftSumAggregate
+      val leftCountAggregate: Alias = getLeftCountAggregate
+      val leftAggregateExpressions = Seq(leftSumAggregate, leftCountAggregate)
+
+      val rightSumAggregate: Alias = getRightSumAggregate
+      val rightCountAggregate: Alias = getRightCountAggregate
+      val rightAggregateExpressions = Seq(rightSumAggregate, rightCountAggregate)
+
+      val termOne = Multiply(leftSumAggregate.toAttribute, Cast(rightCountAggregate.toAttribute, leftSumAggregate.toAttribute.dataType))
+      val termTwo = Multiply(rightSumAggregate.toAttribute, Cast(leftCountAggregate.toAttribute, leftSumAggregate.toAttribute.dataType))
+      val transformedCol = if (transformFunc.isInstanceOf[Add]) Add(termOne, termTwo) else Subtract(termOne, termTwo)
+      Tuple3(leftAggregateExpressions, rightAggregateExpressions, Seq(Alias(transformedCol, aggExpAliasName)()))
+    }
+
+    def transformSumMultiply = {
+      val leftSumAggregate: Alias = getLeftSumAggregate
+      val rightSumAggregate: Alias = getRightSumAggregate
+
+      val transformedCol = Multiply(leftSumAggregate.toAttribute, rightSumAggregate.toAttribute)
+      Tuple3(Seq(leftSumAggregate), Seq(rightSumAggregate), Seq(Alias(transformedCol, aggExpAliasName)()))
+    }
+
+    def transformSumDivide = {
+      val leftSumAggregate: Alias = getLeftSumAggregate
+      val rightInverseSumAggregate: Alias = getRightInverseSumAggName
+
+      val transformedCol = Multiply(leftSumAggregate.toAttribute, rightInverseSumAggregate.toAttribute)
+      Tuple3(Seq(leftSumAggregate), Seq(rightInverseSumAggregate), Seq(Alias(transformedCol, aggExpAliasName)()))
+    }
+
+    def transformCount = {
+      val leftCountAggregate: Alias = getLeftCountAggregate
+      val rightCountAggregate: Alias = getRightCountAggregate
+
+      val transformedCol = Multiply(leftCountAggregate.toAttribute, rightCountAggregate.toAttribute)
+      Tuple3(Seq(leftCountAggregate), Seq(rightCountAggregate), Seq(Alias(transformedCol, aggExpAliasName)()))
+    }
+
+    def transformAverageAddSubtract = {
+      val leftSumAggregate: Alias = getLeftSumAggregate
+      val leftCountAggregate: Alias = getLeftCountAggregate
+      val leftAggregateExpressions = Seq(leftSumAggregate, leftCountAggregate)
+
+      val rightSumAggregate: Alias = getRightSumAggregate
+      val rightCountAggregate: Alias = getRightCountAggregate
+      val rightAggregateExpressions = Seq(rightSumAggregate, rightCountAggregate)
+
+      val termOne = Multiply(leftSumAggregate.toAttribute, Cast(rightCountAggregate.toAttribute, leftSumAggregate.toAttribute.dataType))
+      val termTwo = Multiply(rightSumAggregate.toAttribute, Cast(leftCountAggregate.toAttribute, leftSumAggregate.toAttribute.dataType))
+      val transformedCol = if (transformFunc.isInstanceOf[Add]) {
+        Divide(
+          Add(termOne, termTwo),
+          Cast(Multiply(leftCountAggregate.toAttribute, rightCountAggregate.toAttribute), leftSumAggregate.toAttribute.dataType)
+        )
+      } else {
+        Divide(
+          Subtract(termOne, termTwo),
+          Cast(Multiply(leftCountAggregate.toAttribute, rightCountAggregate.toAttribute), leftSumAggregate.toAttribute.dataType)
+        )
+      }
+      Tuple3(leftAggregateExpressions, rightAggregateExpressions, Seq(Alias(transformedCol, aggExpAliasName)()))
+    }
+
+    def transformAverageMultiply = {
+      val leftSumAggregate: Alias = getLeftSumAggregate
+      val leftCountAggregate: Alias = getLeftCountAggregate
+      val leftAggregateExpressions = Seq(leftSumAggregate, leftCountAggregate)
+
+      val rightSumAggregate: Alias = getRightSumAggregate
+      val rightCountAggregate: Alias = getRightCountAggregate
+      val rightAggregateExpressions = Seq(rightSumAggregate, rightCountAggregate)
+
+      val transformedCol = Divide(
+        Multiply(leftSumAggregate.toAttribute, rightSumAggregate.toAttribute),
+        Cast(Multiply(leftCountAggregate.toAttribute, rightCountAggregate.toAttribute), leftSumAggregate.toAttribute.dataType)
+      )
+
+      Tuple3(leftAggregateExpressions, rightAggregateExpressions, Seq(Alias(transformedCol, aggExpAliasName)()))
+    }
+
+    def transformAverageDivide = {
+      val leftSumAggregate: Alias = getLeftSumAggregate
+      val leftCountAggregate: Alias = getLeftCountAggregate
+      val leftAggregateExpressions = Seq(leftSumAggregate, leftCountAggregate)
+
+      val rightInverseSumAggregate: Alias = getRightInverseSumAggName
+      val rightCountAggregate: Alias = getRightCountAggregate
+      val rightAggregateExpressions = Seq(rightInverseSumAggregate, rightCountAggregate)
+
+      val transformedCol = Divide(
+        Multiply(leftSumAggregate.toAttribute, rightInverseSumAggregate.toAttribute),
+        Cast(Multiply(leftCountAggregate.toAttribute, rightCountAggregate.toAttribute), leftSumAggregate.toAttribute.dataType)
+      )
+      Tuple3(leftAggregateExpressions, rightAggregateExpressions, Seq(Alias(transformedCol, aggExpAliasName)()))
+    }
+
+    def transformMaxAddSubtract = {
+      val leftMaxAggregate: Alias = getLeftMaxAggregate
+      val rightMaxAggregate: Alias = transformFunc match {
+        case _: Add => getRightMaxAggregate
+        case _: Subtract => getRightMaxMinusAggregate
+      }
+
+      val transformedCol = Add(leftMaxAggregate.toAttribute, rightMaxAggregate.toAttribute)
+      Tuple3(Seq(leftMaxAggregate), Seq(rightMaxAggregate), Seq(Alias(transformedCol, aggExpAliasName)()))
+    }
+
+    def transformMinMaxMultiplyDivide = {
+      val leftMaxAggregate: Alias = getLeftMaxAggregate
+      val rightMaxAggregate: Alias = transformFunc match {
+        case _: Multiply => getRightMaxAggregate
+        case _: Divide => getRightMaxInverseAggregate
+      }
+
+      val leftMinAggregate: Alias = getLeftMinAggregate
+      val rightMinAggregate: Alias = transformFunc match {
+        case _: Multiply => getRightMinAggregate
+        case _: Divide => getRightMinInverseAggregate
+      }
+
+      val leftAggregateExpressions = Seq(leftMaxAggregate, leftMinAggregate)
+      val rightAggregateExpressions = Seq(rightMaxAggregate, rightMinAggregate)
+
+      val transformedCol = if (aggregateExpression.aggregateFunction.isInstanceOf[Max]) {
+        Greatest(Seq(
+          Multiply(leftMinAggregate.toAttribute, rightMinAggregate.toAttribute),
+          Multiply(leftMinAggregate.toAttribute, rightMaxAggregate.toAttribute),
+          Multiply(leftMaxAggregate.toAttribute, rightMinAggregate.toAttribute),
+          Multiply(leftMaxAggregate.toAttribute, rightMaxAggregate.toAttribute),
+        ))
+      } else {
+        Least(Seq(
+          Multiply(leftMinAggregate.toAttribute, rightMinAggregate.toAttribute),
+          Multiply(leftMinAggregate.toAttribute, rightMaxAggregate.toAttribute),
+          Multiply(leftMaxAggregate.toAttribute, rightMinAggregate.toAttribute),
+          Multiply(leftMaxAggregate.toAttribute, rightMaxAggregate.toAttribute),
+        ))
+      }
+      Tuple3(leftAggregateExpressions, rightAggregateExpressions, Seq(Alias(transformedCol, aggExpAliasName)()))
+    }
+
+    def transformMinAddSubtract = {
+      val leftMinAggregate: Alias = getLeftMinAggregate
+      val rightMinAggregate = transformFunc match {
+        case _: Add => getRightMinAggregate
+        case _: Subtract => getRightMinMinusAggregate
+      }
+
+      val transformedCol = Add(leftMinAggregate.toAttribute, rightMinAggregate.toAttribute)
+      Tuple3(Seq(leftMinAggregate), Seq(rightMinAggregate), Seq(Alias(transformedCol, aggExpAliasName)()))
+    }
+
+    aggregateExpression.aggregateFunction match {
+      case _: Sum =>
+        transformFunc match {
+          case _: Add => transformSumAddSubtract
+          case _: Subtract => transformSumAddSubtract
+          case _: Multiply => transformSumMultiply
+          case _: Divide => transformSumDivide
+        }
+      case _: Count =>
+        transformFunc match {
+          case _: Add => transformCount
+          case _: Subtract => transformCount
+          case _: Multiply => transformCount
+          case _: Divide => transformCount
+        }
+      case _: Average =>
+        transformFunc match {
+          case _: Add => transformAverageAddSubtract
+          case _: Subtract => transformAverageAddSubtract
+          case _: Multiply => transformAverageMultiply
+          case _: Divide => transformAverageDivide
+        }
+      case _: Max =>
+        transformFunc match {
+          case _: Add => transformMaxAddSubtract
+          case _: Subtract => transformMaxAddSubtract
+          case _: Multiply => transformMinMaxMultiplyDivide
+          case _: Divide => transformMinMaxMultiplyDivide
+        }
+      case _: Min =>
+        transformFunc match {
+          case _: Add => transformMinAddSubtract
+          case _: Subtract => transformMinAddSubtract
+          case _: Multiply => transformMinMaxMultiplyDivide
+          case _: Divide => transformMinMaxMultiplyDivide
+        }
+    }
+  }
+
+  private def transformSimpleAggregation(
+                                          left: LogicalPlan,
+                                          aggregateExpression: AggregateExpression,
+                                          aggExpAliasName: String,
+                                          leftTransformedAggregateExps: Seq[Alias],
+                                          rightTransformedAggregateExps: Seq[Alias]
+                                        ): Tuple3[Seq[Alias], Seq[Alias], Seq[Alias]] = {
+    def getLeftCountAggregate = {
+      val leftCountAggName = "count_left"
+      val leftCountAggregate = findExpression(leftTransformedAggregateExps, leftCountAggName).getOrElse(Alias(AggregateExpression(
+        aggregateFunction = Count(Literal(1)),
+        mode = aggregateExpression.mode,
+        isDistinct = aggregateExpression.isDistinct
+      ), leftCountAggName)())
+      leftCountAggregate
+    }
+
+    def getRightCountAggregate = {
+      val rightCountAggName = "count_right"
+      val rightCountAggregate = findExpression(rightTransformedAggregateExps, rightCountAggName).getOrElse(Alias(AggregateExpression(
+        aggregateFunction = Count(Literal(1)),
+        mode = aggregateExpression.mode,
+        isDistinct = aggregateExpression.isDistinct
+      ), rightCountAggName)())
+      rightCountAggregate
+    }
+
+    def transformSum = {
+      val aggRef = aggregateExpression.references.toSeq.head
+      if (left.references.contains(aggRef) || left.asInstanceOf[Project].projectList.map(_.name).contains(aggRef.name)) {
+        val leftSumAggregate = Alias(AggregateExpression(
+          aggregateFunction = Sum(aggRef),
+          mode = aggregateExpression.mode,
+          isDistinct = aggregateExpression.isDistinct
+        ), aggRef.name)()
+        val rightCountAggregate = getRightCountAggregate
+
+        val transformedCol = Multiply(leftSumAggregate.toAttribute, Cast(rightCountAggregate.toAttribute, leftSumAggregate.toAttribute.dataType))
+        Tuple3(Seq(leftSumAggregate), Seq(rightCountAggregate), Seq(Alias(transformedCol, aggExpAliasName)()))
+      }
+      else {
+        val rightSumAggregate = Alias(AggregateExpression(
+          aggregateFunction = Sum(aggRef),
+          mode = aggregateExpression.mode,
+          isDistinct = aggregateExpression.isDistinct
+        ), aggRef.name)()
+        val leftCountAggregate = getLeftCountAggregate
+
+        val transformedCol = Multiply(rightSumAggregate.toAttribute, Cast(leftCountAggregate.toAttribute, rightSumAggregate.toAttribute.dataType))
+        Tuple3(Seq(leftCountAggregate), Seq(rightSumAggregate), Seq(Alias(transformedCol, aggExpAliasName)()))
+      }
+    }
+
+    def transformCount = {
+      val leftCountAggregate = getLeftCountAggregate
+      val rightCountAggregate = getRightCountAggregate
+
+      val transformedCol = Multiply(leftCountAggregate.toAttribute, rightCountAggregate.toAttribute)
+      Tuple3(Seq(leftCountAggregate), Seq(rightCountAggregate), Seq(Alias(transformedCol, aggExpAliasName)()))
+    }
+
+    def transformAverage = {
+      val aggRef = aggregateExpression.references.toSeq.head
+      if (left.references.contains(aggRef) || left.asInstanceOf[Project].projectList.map(_.name).contains(aggRef.name)) {
+        val leftSumAggregate = Alias(AggregateExpression(
+          aggregateFunction = Sum(aggRef),
+          mode = aggregateExpression.mode,
+          isDistinct = aggregateExpression.isDistinct
+        ), aggRef.name)()
+        val leftCountAggregate = getLeftCountAggregate
+        val rightCountAggregate = getRightCountAggregate
+
+        val transformedCol = Divide(
+          Multiply(leftSumAggregate.toAttribute, Cast(rightCountAggregate.toAttribute, leftSumAggregate.toAttribute.dataType)),
+          Cast(Multiply(leftCountAggregate.toAttribute, rightCountAggregate.toAttribute), leftSumAggregate.toAttribute.dataType)
+        )
+        Tuple3(Seq(leftSumAggregate, leftCountAggregate), Seq(rightCountAggregate), Seq(Alias(transformedCol, aggExpAliasName)()))
+      }
+      else {
+        val rightSumAggregate = Alias(AggregateExpression(
+          aggregateFunction = Sum(aggRef),
+          mode = aggregateExpression.mode,
+          isDistinct = aggregateExpression.isDistinct
+        ), aggRef.name)()
+        val rightCountAggregate = getRightCountAggregate
+        val leftCountAggregate = getLeftCountAggregate
+
+        val transformedCol = Divide(
+          Multiply(rightSumAggregate.toAttribute, Cast(leftCountAggregate.toAttribute, rightSumAggregate.toAttribute.dataType)),
+          Cast(Multiply(leftCountAggregate.toAttribute, rightCountAggregate.toAttribute), rightSumAggregate.toAttribute.dataType)
+        )
+        Tuple3(Seq(leftCountAggregate), Seq(rightSumAggregate, rightCountAggregate), Seq(Alias(transformedCol, aggExpAliasName)()))
+      }
+    }
+
+    def transformMin = {
+      val aggRef = aggregateExpression.references.toSeq.head
+      if (left.references.contains(aggRef) || left.asInstanceOf[Project].projectList.map(_.name).contains(aggRef.name)) {
+        val leftMinAggregate = Alias(AggregateExpression(
+          aggregateFunction = Min(aggRef),
+          mode = aggregateExpression.mode,
+          isDistinct = aggregateExpression.isDistinct
+        ), aggRef.name)()
+        Tuple3(Seq(leftMinAggregate), Seq(), Seq(Alias(leftMinAggregate, aggExpAliasName)()))
+      }
+      else {
+        val rightMinAggregate = Alias(AggregateExpression(
+          aggregateFunction = Min(aggRef),
+          mode = aggregateExpression.mode,
+          isDistinct = aggregateExpression.isDistinct
+        ), aggRef.name)()
+        Tuple3(Seq(), Seq(rightMinAggregate), Seq(Alias(rightMinAggregate, aggExpAliasName)()))
+      }
+    }
+
+    def transformMax = {
+      val aggRef = aggregateExpression.references.toSeq.head
+      if (left.references.contains(aggRef) || left.asInstanceOf[Project].projectList.map(_.name).contains(aggRef.name)) {
+        val leftMaxAggregate = Alias(AggregateExpression(
+          aggregateFunction = Max(aggRef),
+          mode = aggregateExpression.mode,
+          isDistinct = aggregateExpression.isDistinct
+        ), aggRef.name)()
+        Tuple3(Seq(leftMaxAggregate), Seq(), Seq(Alias(leftMaxAggregate, aggExpAliasName)()))
+      }
+      else {
+        val rightMaxAggregate = Alias(AggregateExpression(
+          aggregateFunction = Max(aggRef),
+          mode = aggregateExpression.mode,
+          isDistinct = aggregateExpression.isDistinct
+        ), aggRef.name)()
+        Tuple3(Seq(), Seq(rightMaxAggregate), Seq(Alias(rightMaxAggregate, aggExpAliasName)()))
+      }
+    }
+
+    aggregateExpression.aggregateFunction match {
+      case _: Sum => transformSum
+      case _: Count => transformCount
+      case _: Average => transformAverage
+      case _: Min => transformMin
+      case _: Max => transformMax
+    }
+  }
+}
