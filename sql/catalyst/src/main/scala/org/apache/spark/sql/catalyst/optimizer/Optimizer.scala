@@ -2762,16 +2762,16 @@ object PushAggregationBeforeJoin extends Rule[LogicalPlan] {
           aggregateFunction = Min(aggRef),
           mode = aggregateExpression.mode,
           isDistinct = aggregateExpression.isDistinct
-        ), aggRef.name)()
-        Tuple3(Seq(leftMinAggregate), Seq(), Seq(Alias(leftMinAggregate, aggExpAliasName)()))
+        ), aggExpAliasName)()
+        Tuple3(Seq(leftMinAggregate), Seq(), Seq(leftMinAggregate))
       }
       else {
         val rightMinAggregate = Alias(AggregateExpression(
           aggregateFunction = Min(aggRef),
           mode = aggregateExpression.mode,
           isDistinct = aggregateExpression.isDistinct
-        ), aggRef.name)()
-        Tuple3(Seq(), Seq(rightMinAggregate), Seq(Alias(rightMinAggregate, aggExpAliasName)()))
+        ), aggExpAliasName)()
+        Tuple3(Seq(), Seq(rightMinAggregate), Seq(rightMinAggregate))
       }
     }
 
@@ -2782,16 +2782,16 @@ object PushAggregationBeforeJoin extends Rule[LogicalPlan] {
           aggregateFunction = Max(aggRef),
           mode = aggregateExpression.mode,
           isDistinct = aggregateExpression.isDistinct
-        ), aggRef.name)()
-        Tuple3(Seq(leftMaxAggregate), Seq(), Seq(Alias(leftMaxAggregate, aggExpAliasName)()))
+        ), aggExpAliasName)()
+        Tuple3(Seq(leftMaxAggregate), Seq(), Seq(leftMaxAggregate))
       }
       else {
         val rightMaxAggregate = Alias(AggregateExpression(
           aggregateFunction = Max(aggRef),
           mode = aggregateExpression.mode,
           isDistinct = aggregateExpression.isDistinct
-        ), aggRef.name)()
-        Tuple3(Seq(), Seq(rightMaxAggregate), Seq(Alias(rightMaxAggregate, aggExpAliasName)()))
+        ), aggExpAliasName)()
+        Tuple3(Seq(), Seq(rightMaxAggregate), Seq(rightMaxAggregate))
       }
     }
 
